@@ -19,3 +19,5 @@ android.keystore
 *.vert
 *.metal
 .vscode/
+
+./Cargo.lock
