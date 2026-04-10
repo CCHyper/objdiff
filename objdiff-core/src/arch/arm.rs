@@ -421,7 +421,8 @@ impl Arch for ArchArm {
                 elf::R_ARM_THM_PC9 => Some("R_ARM_THM_PC9"),
                 _ => None,
             },
-            _ => None,
+            RelocationFlags::Omf { .. } => None,
+            RelocationFlags::Coff(_) => None,
         }
     }
 
@@ -442,7 +443,8 @@ impl Arch for ArchArm {
                 elf::R_ARM_THM_PC9 => 2,
                 _ => 1,
             },
-            _ => 1,
+            RelocationFlags::Omf { .. } => 1,
+            RelocationFlags::Coff(_) => 1,
         }
     }
 

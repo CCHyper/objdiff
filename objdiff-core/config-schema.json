@@ -58,6 +58,16 @@
           "value": "gnu_legacy",
           "name": "GNU g++ (Legacy)",
           "description": "Use the old GNU mangling ABI. Used up to g++ 2.9.x"
+        },
+        {
+          "value": "watcom",
+          "name": "Watcom",
+          "description": "Watcom / Open Watcom C++ mangling (W? prefix). Used by Watcom C++ 10.x/11.x and Open Watcom."
+        },
+        {
+          "value": "borland",
+          "name": "Borland",
+          "description": "Borland C++ mangling (@Class@Func$q prefix). Used by Borland C++ 3.x/4.x/5.x and Turbo C++."
         }
       ]
     },
@@ -116,6 +126,13 @@
       "default": false,
       "name": "Combine text sections",
       "description": "Combines all text sections into one."
+    },
+    {
+      "id": "combineOmfSections",
+      "type": "boolean",
+      "default": false,
+      "name": "Combine OMF sections",
+      "description": "Merges COMDAT and same-named OMF segments into shared sections. Useful for Watcom/Borland objects that emit one segment per function."
     },
     {
       "id": "preferredStringEncoding",
@@ -389,7 +406,8 @@
         "showSymbolSizes",
         "spaceBetweenArgs",
         "combineDataSections",
-        "combineTextSections"
+        "combineTextSections",
+        "combineOmfSections"
       ]
     },
     {

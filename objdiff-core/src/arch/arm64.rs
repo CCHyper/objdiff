@@ -123,7 +123,8 @@ impl Arch for ArchArm64 {
                 elf::R_AARCH64_LD64_GOT_LO12_NC => Some("R_AARCH64_LD64_GOT_LO12_NC"),
                 _ => None,
             },
-            _ => None,
+            RelocationFlags::Omf { .. } => None,
+            RelocationFlags::Coff(_) => None,
         }
     }
 
@@ -138,7 +139,8 @@ impl Arch for ArchArm64 {
                 elf::R_AARCH64_PREL16 => 2,
                 _ => 1,
             },
-            _ => 1,
+            RelocationFlags::Omf { .. } => 1,
+            RelocationFlags::Coff(_) => 1,
         }
     }
 }

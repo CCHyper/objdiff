@@ -20,10 +20,12 @@ use crate::{
     obj::{InstructionRef, Object, Relocation, SectionKind, Symbol, SymbolFlag},
 };
 
+pub mod borland;
 pub mod code;
 pub mod data;
 pub mod demangler;
 pub mod display;
+pub mod watcom;
 
 include!(concat!(env!("OUT_DIR"), "/config.gen.rs"));
 

@@ -174,7 +174,8 @@ impl Arch for ArchSuperH {
                 elf::R_SH_GOTPC => Some("R_SH_GOTPC"),
                 _ => None,
             },
-            _ => None,
+            RelocationFlags::Omf { .. } => None,
+            RelocationFlags::Coff(_) => None,
         }
     }
 
@@ -182,7 +183,8 @@ impl Arch for ArchSuperH {
         match flags {
             RelocationFlags::Elf(elf::R_SH_DIR32) => 4,
             RelocationFlags::Elf(_) => 1,
-            _ => 1,
+            RelocationFlags::Omf { .. } => 1,
+            RelocationFlags::Coff(_) => 1,
         }
     }
 }

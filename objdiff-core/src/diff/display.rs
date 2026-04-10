@@ -205,6 +205,7 @@ pub fn display_row(
     } else {
         None
     };
+
     obj.arch.display_instruction(resolved, diff_config, &mut |part| match part {
         InstructionPart::Basic(text) => {
             if text.chars().all(|c| c == ' ') {
@@ -251,18 +252,18 @@ pub fn display_row(
                     })
                 },
                 (InstructionArg::Reloc, _, None) => {
-                    let resolved = resolved.relocation.unwrap();
+                    let resolved_reloc = resolved.relocation.unwrap();
                     let color = diff_index
                         .get()
                         .map_or(DiffTextColor::Bright, |i| DiffTextColor::Rotating(i as u8));
                     cb(DiffTextSegment {
-                        text: DiffText::Symbol(resolved.symbol),
+                        text: DiffText::Symbol(resolved_reloc.symbol),
                         color,
                         pad_to: 0,
                     })?;
-                    if resolved.relocation.addend != 0 {
+                    if resolved_reloc.relocation.addend != 0 {
                         cb(DiffTextSegment {
-                            text: DiffText::Addend(resolved.relocation.addend),
+                            text: DiffText::Addend(resolved_reloc.relocation.addend),
                             color,
                             pad_to: 0,
                         })?;
@@ -320,6 +321,28 @@ pub fn display_row(
             color: DiffTextColor::Rotating(branch.branch_idx as u8),
             pad_to: 0,
         })?;
+    }
+    // Emit section-relative comment for relocations to data sections
+    if let Some(resolved_reloc) = &resolved.relocation {
+        let target_sym = resolved_reloc.symbol;
+        if let Some(target_section_idx) = target_sym.section {
+            if let Some(target_section) = obj.sections.get(target_section_idx) {
+                if !matches!(target_section.kind, SectionKind::Code) {
+                    let addr = target_sym
+                        .address
+                        .wrapping_add_signed(resolved_reloc.relocation.addend);
+                    let comment = if target_sym.kind == SymbolKind::Section {
+                        // Target is a raw section symbol (e.g. _DATA+0x180).
+                        // The operand already shows section+addend, so just add a hint.
+                        format!(" ; possible {} offset?", target_section.name)
+                    } else {
+                        // Target is a named symbol — show the section-relative address
+                        format!(" ; {}+{:#x}", target_section.name, addr)
+                    };
+                    cb(DiffTextSegment::basic(&comment, DiffTextColor::Dim))?;
+                }
+            }
+        }
     }
     cb(EOL_SEGMENT)?;
     Ok(())

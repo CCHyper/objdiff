@@ -16,7 +16,7 @@ use crate::{
     diff::{DiffObjConfig, DiffSide},
     obj::{
         FlowAnalysisResult, Object, Relocation, RelocationFlags, Section, SectionData, SectionFlag,
-        SectionKind, Symbol, SymbolFlag, SymbolFlagSet, SymbolKind,
+        SectionFlagSet, SectionKind, Symbol, SymbolFlag, SymbolFlagSet, SymbolKind,
         split_meta::{SPLITMETA_SECTION, SplitMeta},
     },
     util::{align_data_slice_to, align_u64_to, read_u16, read_u32},
@@ -398,6 +398,22 @@ fn map_sections(
         *unique_id += 1;
 
         section_indices[section.index().0] = result.len();
+        // For OMF code sections, detect USE16 (16-bit) vs USE32 (32-bit) from the
+        // section flags exposed by the object crate fork.
+        let mut section_flags = SectionFlagSet::default();
+        if kind == SectionKind::Code {
+            if let object::SectionFlags::Omf { use32 } = section.flags() {
+                if !use32 {
+                    section_flags |= SectionFlag::Code16Bit;
+                }
+            }
+        }
+        if matches!(
+            section.kind(),
+            object::SectionKind::ReadOnlyData | object::SectionKind::ReadOnlyString
+        ) {
+            section_flags |= SectionFlag::ReadOnly;
+        }
         result.push(Section {
             id,
             name: name.to_string(),
@@ -405,7 +421,7 @@ fn map_sections(
             size: section.size(),
             kind,
             data: SectionData(data),
-            flags: Default::default(),
+            flags: section_flags,
             align: NonZeroU64::new(section.align()),
             relocations: Default::default(),
             virtual_address,
@@ -579,6 +595,9 @@ fn map_section_relocations(
         let flags = match reloc.flags() {
             object::RelocationFlags::Elf { r_type } => RelocationFlags::Elf(r_type),
             object::RelocationFlags::Coff { typ } => RelocationFlags::Coff(typ),
+            object::RelocationFlags::Omf { location, mode, .. } => {
+                RelocationFlags::Omf { location, mode }
+            }
             flags => bail!("Unhandled relocation flags: {:?}", flags),
         };
         let target_symbol = match symbol_indices.get(symbol_index.0).copied() {
@@ -635,6 +654,175 @@ fn map_relocations(
         }
     }
     Ok(())
+}
+
+/// Try to extract a symbol-friendly label from a null-terminated ASCII string.
+///
+/// Returns `None` if the data is not a valid null-terminated printable ASCII string,
+/// is empty, or consists entirely of non-identifier characters after sanitisation.
+fn extract_ascii_label(bytes: &[u8]) -> Option<String> {
+    // Need at least 2 bytes (1 char + null terminator)
+    if bytes.len() < 2 {
+        return None;
+    }
+
+    // Find the null terminator
+    let nul_pos = bytes.iter().position(|&b| b == 0)?;
+    if nul_pos == 0 {
+        return None; // empty string
+    }
+
+    let str_bytes = &bytes[..nul_pos];
+
+    // All bytes must be printable ASCII (0x20..=0x7E)
+    if !str_bytes.iter().all(|&b| (0x20..=0x7E).contains(&b)) {
+        return None;
+    }
+
+    let s = core::str::from_utf8(str_bytes).ok()?;
+
+    // Truncate long strings for the label name
+    const MAX_LABEL_LEN: usize = 32;
+    let label_source = if s.len() > MAX_LABEL_LEN { &s[..MAX_LABEL_LEN] } else { s };
+
+    // Sanitise: keep alphanumeric and underscore, replace everything else
+    let mut label = String::with_capacity(label_source.len());
+    for ch in label_source.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            label.push(ch);
+        } else {
+            label.push('_');
+        }
+    }
+
+    // Prefix with underscore if it starts with a digit
+    if label.starts_with(|c: char| c.is_ascii_digit()) {
+        label.insert(0, '_');
+    }
+
+    if label.is_empty() {
+        return None;
+    }
+
+    Some(label)
+}
+
+/// Synthesise named data symbols for relocations that target section symbols
+/// where the data at the target offset is a null-terminated ASCII string.
+///
+/// This replaces the generic `[SECTION_NAME]` display with a proper symbol name
+/// derived from the string content (e.g. `V2RL` for `"V2RL\0"`).
+fn synthesize_data_labels(sections: &mut [Section], symbols: &mut Vec<Symbol>) {
+    // (target_section_idx, target_address) -> index into symbols Vec
+    let mut created: BTreeMap<(usize, u64), usize> = BTreeMap::new();
+
+    // Pass 1: find candidates and create synthetic symbols.
+    for section in sections.iter() {
+        for reloc in &section.relocations {
+            let target_sym = match symbols.get(reloc.target_symbol) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Only process relocations targeting section-kind symbols
+            if target_sym.kind != SymbolKind::Section {
+                continue;
+            }
+            if reloc.addend < 0 {
+                continue;
+            }
+
+            let target_section_idx = match target_sym.section {
+                Some(idx) => idx,
+                None => continue,
+            };
+            let target_section = match sections.get(target_section_idx) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Only synthesize labels in read-only data sections (e.g. CONST, .rodata)
+            // where string literals are expected.  Writable data sections like _DATA
+            // contain variables/structs whose bytes may incidentally look like ASCII.
+            if !target_section.flags.contains(SectionFlag::ReadOnly) {
+                continue;
+            }
+
+            // Compute the byte offset into the target section's data
+            let target_address = target_sym.address.wrapping_add_signed(reloc.addend);
+            let byte_offset = match target_address.checked_sub(target_section.address) {
+                Some(o) if (o as usize) < target_section.data.len() => o as usize,
+                _ => continue,
+            };
+
+            let dedup_key = (target_section_idx, target_address);
+            if created.contains_key(&dedup_key) {
+                continue; // already created a symbol for this location
+            }
+
+            let bytes = &target_section.data.0[byte_offset..];
+            let label_name = match extract_ascii_label(bytes) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            // String size including null terminator
+            let nul_pos = match bytes.iter().position(|&b| b == 0) {
+                Some(pos) => pos,
+                None => continue,
+            };
+            let string_size = (nul_pos + 1) as u64;
+
+            // Build a display name with quotes so it's clear this is a string literal.
+            // Use the original string content (before sanitization).
+            let original_str = core::str::from_utf8(&bytes[..nul_pos]).unwrap_or(&label_name);
+            let display_name = format!("\"{}\"", original_str);
+
+            let new_sym_idx = symbols.len();
+            symbols.push(Symbol {
+                name: label_name,
+                demangled_name: Some(display_name),
+                address: target_address,
+                size: string_size,
+                kind: SymbolKind::Object,
+                section: Some(target_section_idx),
+                flags: SymbolFlag::Local | SymbolFlag::SizeInferred,
+                align: None,
+                virtual_address: None,
+            });
+            created.insert(dedup_key, new_sym_idx);
+        }
+    }
+
+    if created.is_empty() {
+        return;
+    }
+
+    // Pass 2: update relocations to point to synthetic symbols.
+    for section in sections.iter_mut() {
+        for reloc in section.relocations.iter_mut() {
+            let target_sym = match symbols.get(reloc.target_symbol) {
+                Some(s) => s,
+                None => continue,
+            };
+            if target_sym.kind != SymbolKind::Section {
+                continue;
+            }
+            if reloc.addend < 0 {
+                continue;
+            }
+            let target_section_idx = match target_sym.section {
+                Some(idx) => idx,
+                None => continue,
+            };
+            let target_address = target_sym.address.wrapping_add_signed(reloc.addend);
+            let dedup_key = (target_section_idx, target_address);
+            if let Some(&new_sym_idx) = created.get(&dedup_key) {
+                reloc.target_symbol = new_sym_idx;
+                reloc.addend = 0;
+            }
+        }
+    }
 }
 
 fn perform_data_flow_analysis(obj: &mut Object, config: &DiffObjConfig) -> Result<()> {
@@ -721,6 +909,13 @@ fn parse_line_info(
         && let Err(e) = parse_line_info_coff(coff, sections, section_indices, obj_data)
     {
         log::warn!("Failed to parse COFF line info: {e}");
+    }
+
+    // OMF
+    if let object::File::Omf(omf) = obj_file
+        && let Err(e) = parse_line_info_omf(omf, sections, section_indices)
+    {
+        log::warn!("Failed to parse OMF line info: {e}");
     }
 
     if let Err(e) = super::mdebug::parse_line_info_mdebug(obj_file, sections) {
@@ -882,6 +1077,30 @@ fn parse_line_info_coff(
                     .line_info
                     .insert(sect.address() + vaddr as u64, cur_linenumber + line_number as u32);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Parse line number info from OMF LINNUM records.
+fn parse_line_info_omf(
+    omf: &object::read::omf::OmfFile,
+    sections: &mut [Section],
+    section_indices: &[usize],
+) -> Result<()> {
+    let segments = omf.raw_segments();
+    for (seg_idx, _seg) in segments.iter().enumerate() {
+        // OMF SectionIndex is 1-based: segment 0 → SectionIndex(1).
+        let section_index_0 = seg_idx + 1;
+        let Some(&out_idx) = section_indices.get(section_index_0) else {
+            continue;
+        };
+        if out_idx == usize::MAX {
+            continue; // section was filtered out
+        }
+        let out_section = &mut sections[out_idx];
+        for &(line, offset) in omf.segment_line_numbers(seg_idx) {
+            out_section.line_info.insert(offset as u64, line as u32);
         }
     }
     Ok(())
@@ -1070,7 +1289,12 @@ pub fn read(
 }
 
 pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result<Object> {
-    let obj_file = object::File::parse(data)?;
+    let mut obj_file = object::File::parse(data)?;
+    if config.combine_omf_sections {
+        if let object::File::Omf(ref mut omf) = obj_file {
+            omf.merge_sections();
+        }
+    }
     let mut arch = new_arch(&obj_file, diff_side)?;
     let split_meta = parse_split_meta(&obj_file)?;
     let (mut sections, section_indices) =
@@ -1085,6 +1309,7 @@ pub fn parse(data: &[u8], config: &DiffObjConfig, diff_side: DiffSide) -> Result
     )?;
     map_relocations(arch.as_ref(), &obj_file, &mut sections, &section_indices, &symbol_indices)?;
     parse_line_info(&obj_file, &mut sections, &section_indices, data)?;
+    synthesize_data_labels(&mut sections, &mut symbols);
     if config.combine_data_sections || config.combine_text_sections {
         combine_sections(&mut sections, &mut symbols, config)?;
     }

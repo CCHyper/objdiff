@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, vec::Vec};
 use core::cmp::Ordering;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,17 +7,21 @@ use iced_x86::{
     Instruction, IntelFormatter, MasmFormatter, NasmFormatter, NumberKind, OpKind, Register,
 };
 use object::{Endian as _, Object as _, ObjectSection as _, elf, pe};
+use object::omf::{FixupLocation, FixupMode};
 
 use crate::{
     arch::{Arch, OPCODE_DATA, RelocationOverride, RelocationOverrideTarget},
     diff::{DiffObjConfig, X86Formatter, display::InstructionPart},
-    obj::{InstructionRef, Relocation, RelocationFlags, ResolvedInstructionRef, Section, Symbol},
+    obj::{InstructionRef, Relocation, RelocationFlags, ResolvedInstructionRef, Section, SectionFlag, Symbol},
 };
 
 #[derive(Debug)]
 pub struct ArchX86 {
     arch: Architecture,
     endianness: object::Endianness,
+    /// Maps section index → decoder bitness (16, 32, or 64).
+    /// Populated in `post_init` from `SectionFlag::Code16Bit`.
+    section_bitness: BTreeMap<usize, u32>,
 }
 
 #[derive(Debug)]
@@ -33,19 +37,18 @@ impl ArchX86 {
             object::Architecture::X86_64 => Architecture::X86_64,
             _ => bail!("Unsupported architecture for ArchX86: {:?}", object.architecture()),
         };
-        Ok(Self { arch, endianness: object.endianness() })
+        Ok(Self { arch, endianness: object.endianness(), section_bitness: BTreeMap::new() })
     }
 
-    fn decoder<'a>(&self, code: &'a [u8], address: u64) -> Decoder<'a> {
-        Decoder::with_ip(
-            match self.arch {
-                Architecture::X86 => 32,
-                Architecture::X86_64 => 64,
-            },
-            code,
-            address,
-            DecoderOptions::NONE,
-        )
+    fn default_bitness(&self) -> u32 {
+        match self.arch {
+            Architecture::X86 => 32,
+            Architecture::X86_64 => 64,
+        }
+    }
+
+    fn decoder<'a>(&self, code: &'a [u8], address: u64, bitness: u32) -> Decoder<'a> {
+        Decoder::with_ip(bitness, code, address, DecoderOptions::NONE)
     }
 
     fn formatter(&self, diff_config: &DiffObjConfig) -> Box<dyn iced_x86::Formatter> {
@@ -60,6 +63,18 @@ impl ArchX86 {
     }
 
     fn reloc_size(&self, flags: RelocationFlags) -> Option<usize> {
+        // OMF relocation size is determined entirely by the fixup location type,
+        // independent of CPU word size.
+        if let RelocationFlags::Omf { location, .. } = flags {
+            return Some(match location {
+                FixupLocation::LowByte | FixupLocation::HighByte => 1,
+                FixupLocation::Offset | FixupLocation::LoaderOffset | FixupLocation::Base => 2,
+                FixupLocation::Pointer
+                | FixupLocation::Offset32
+                | FixupLocation::LoaderOffset32 => 4,
+                FixupLocation::Pointer48 => 6,
+            });
+        }
         match self.arch {
             Architecture::X86 => match flags {
                 RelocationFlags::Coff(typ) => match typ {
@@ -77,6 +92,7 @@ impl ArchX86 {
                     elf::R_386_16 => Some(2),
                     _ => None,
                 },
+                RelocationFlags::Omf { .. } => unreachable!(),
             },
             Architecture::X86_64 => match flags {
                 RelocationFlags::Coff(typ) => match typ {
@@ -96,22 +112,37 @@ impl ArchX86 {
                     elf::R_X86_64_64 => Some(8),
                     _ => None,
                 },
+                RelocationFlags::Omf { .. } => unreachable!(),
             },
         }
     }
 }
 
 impl Arch for ArchX86 {
+    fn post_init(&mut self, sections: &[Section], _symbols: &[Symbol]) {
+        self.section_bitness.clear();
+        for (index, section) in sections.iter().enumerate() {
+            let bitness = if section.flags.contains(SectionFlag::Code16Bit) {
+                16
+            } else {
+                self.default_bitness()
+            };
+            self.section_bitness.insert(index, bitness);
+        }
+    }
+
     fn scan_instructions_internal(
         &self,
         address: u64,
         code: &[u8],
-        _section_index: usize,
+        section_index: usize,
         relocations: &[Relocation],
         _diff_config: &DiffObjConfig,
     ) -> Result<Vec<InstructionRef>> {
         let mut out = Vec::with_capacity(code.len() / 2);
-        let mut decoder = self.decoder(code, address);
+        let bitness =
+            self.section_bitness.get(&section_index).copied().unwrap_or_else(|| self.default_bitness());
+        let mut decoder = self.decoder(code, address, bitness);
         let mut instruction = Instruction::default();
         let mut reloc_iter = relocations.iter().peekable();
         'outer: while decoder.can_decode() {
@@ -206,8 +237,15 @@ impl Arch for ArchX86 {
         if resolved.ins_ref.opcode == OPCODE_DATA {
             let (mnemonic, imm) = match resolved.ins_ref.size {
                 1 => (".byte", resolved.code[0] as u64),
-                2 => (".word", self.endianness.read_u16(resolved.code.try_into()?) as u64),
-                4 => (".dword", self.endianness.read_u32(resolved.code.try_into()?) as u64),
+                2 => (".word", self.endianness.read_u16_bytes(resolved.code.try_into()?) as u64),
+                4 => (".dword", self.endianness.read_u32_bytes(resolved.code.try_into()?) as u64),
+                6 => {
+                    // 48-bit OMF far pointer: 32-bit offset + 16-bit segment selector.
+                    let buf: [u8; 6] = resolved.code.try_into()?;
+                    let lo = self.endianness.read_u32_bytes(buf[..4].try_into()?);
+                    let hi = self.endianness.read_u16_bytes(buf[4..6].try_into()?);
+                    (".ptr48", ((hi as u64) << 32) | lo as u64)
+                }
                 _ => bail!("Unsupported x86 inline data size {}", resolved.ins_ref.size),
             };
             cb(InstructionPart::opcode(mnemonic, OPCODE_DATA))?;
@@ -219,7 +257,12 @@ impl Arch for ArchX86 {
             return Ok(());
         }
 
-        let mut decoder = self.decoder(resolved.code, resolved.ins_ref.address);
+        let bitness = self
+            .section_bitness
+            .get(&resolved.section_index)
+            .copied()
+            .unwrap_or_else(|| self.default_bitness());
+        let mut decoder = self.decoder(resolved.code, resolved.ins_ref.address, bitness);
         let mut formatter = self.formatter(diff_config);
         let mut instruction = Instruction::default();
         decoder.decode_out(&mut instruction);
@@ -303,6 +346,31 @@ impl Arch for ArchX86 {
                         section.data()?[address as usize..address as usize + 4].try_into()?;
                     self.endianness.read_i32(data) as i64
                 }
+                object::RelocationFlags::Omf { location, .. } => {
+                    let sec_data = section.uncompressed_data()?;
+                    let off = address as usize;
+                    match location {
+                        object::omf::FixupLocation::Offset32
+                        | object::omf::FixupLocation::LoaderOffset32
+                        | object::omf::FixupLocation::Pointer48 => {
+                            // 32-bit offset (or offset32 portion of seg:offset48)
+                            let data = sec_data[off..off + 4].try_into()?;
+                            self.endianness.read_i32_bytes(data) as i64
+                        }
+                        object::omf::FixupLocation::Offset
+                        | object::omf::FixupLocation::LoaderOffset
+                        | object::omf::FixupLocation::Pointer
+                        | object::omf::FixupLocation::Base => {
+                            // 16-bit offset (or offset16 portion of seg:offset32)
+                            let data = sec_data[off..off + 2].try_into()?;
+                            self.endianness.read_i16_bytes(data) as i64
+                        }
+                        object::omf::FixupLocation::LowByte
+                        | object::omf::FixupLocation::HighByte => {
+                            sec_data[off] as i8 as i64
+                        }
+                    }
+                }
                 flags => bail!("Unsupported x86 implicit relocation {flags:?}"),
             },
             Architecture::X86_64 => match relocation.flags() {
@@ -335,6 +403,26 @@ impl Arch for ArchX86 {
     }
 
     fn reloc_name(&self, flags: RelocationFlags) -> Option<&'static str> {
+        // OMF reloc names are arch-independent.
+        if let RelocationFlags::Omf { location, mode } = flags {
+            return Some(match location {
+                FixupLocation::LowByte => "OMF_LOW_BYTE",
+                FixupLocation::HighByte => "OMF_HIGH_BYTE",
+                FixupLocation::Offset => match mode {
+                    FixupMode::SelfRelative => "OMF_REL_OFFSET",
+                    FixupMode::SegmentRelative => "OMF_OFFSET",
+                },
+                FixupLocation::LoaderOffset => "OMF_LOADER_OFFSET",
+                FixupLocation::Base => "OMF_BASE",
+                FixupLocation::Pointer => "OMF_PTR",
+                FixupLocation::Offset32 => match mode {
+                    FixupMode::SelfRelative => "OMF_REL_OFFSET32",
+                    FixupMode::SegmentRelative => "OMF_OFFSET32",
+                },
+                FixupLocation::LoaderOffset32 => "OMF_LOADER_OFFSET32",
+                FixupLocation::Pointer48 => "OMF_PTR48",
+            });
+        }
         match self.arch {
             Architecture::X86 => match flags {
                 RelocationFlags::Coff(typ) => match typ {
@@ -387,8 +475,11 @@ impl Arch for ArchX86 {
         let Some(code) = section.data_range(symbol.address, size) else {
             return Ok(0);
         };
-        // Decode instructions to find the last non-NOP instruction
-        let mut decoder = self.decoder(code, symbol.address);
+        // Decode instructions to find the last non-NOP instruction.
+        // Use 16-bit mode for OMF USE16 code sections.
+        let bitness =
+            if section.flags.contains(SectionFlag::Code16Bit) { 16 } else { self.default_bitness() };
+        let mut decoder = self.decoder(code, symbol.address, bitness);
         let mut instruction = Instruction::default();
         let mut new_address = 0;
         let mut reloc_iter = section.relocations.iter().peekable();
@@ -574,6 +665,7 @@ impl FormatterOutput for InstructionFormatterOutput<'_> {
     }
 }
 
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -581,7 +673,7 @@ mod test {
 
     #[test]
     fn test_scan_instructions() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [
             0xc7, 0x85, 0x68, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x04, 0x85, 0x00,
             0x00, 0x00, 0x00,
@@ -601,7 +693,7 @@ mod test {
 
     #[test]
     fn test_process_instruction() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0xc7, 0x85, 0x68, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Mov as u16;
         let mut parts = Vec::new();
@@ -637,7 +729,7 @@ mod test {
 
     #[test]
     fn test_process_instruction_with_reloc_1() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0xc7, 0x85, 0x68, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Mov as u16;
         let mut parts = Vec::new();
@@ -682,7 +774,7 @@ mod test {
 
     #[test]
     fn test_process_instruction_with_reloc_2() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0x8b, 0x04, 0x85, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Mov as u16;
         let mut parts = Vec::new();
@@ -725,7 +817,7 @@ mod test {
 
     #[test]
     fn test_process_instruction_with_reloc_3() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0xe8, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Call as u16;
         let mut parts = Vec::new();
@@ -756,7 +848,7 @@ mod test {
 
     #[test]
     fn test_process_instruction_with_reloc_4() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0x8b, 0x15, 0xa4, 0x21, 0x7e, 0x00];
         let opcode = iced_x86::Mnemonic::Mov as u16;
         let mut parts = Vec::new();
@@ -795,7 +887,7 @@ mod test {
 
     #[test]
     fn test_process_x86_64_instruction_with_reloc_1() {
-        let arch = ArchX86 { arch: Architecture::X86_64, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86_64, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Mov as u16;
         let mut parts = Vec::new();
@@ -834,7 +926,7 @@ mod test {
 
     #[test]
     fn test_process_x86_64_instruction_with_reloc_2() {
-        let arch = ArchX86 { arch: Architecture::X86_64, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86_64, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0xe8, 0x00, 0x00, 0x00, 0x00];
         let opcode = iced_x86::Mnemonic::Call as u16;
         let mut parts = Vec::new();
@@ -865,7 +957,7 @@ mod test {
 
     #[test]
     fn test_display_1_byte_inline_data() {
-        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little };
+        let arch = ArchX86 { arch: Architecture::X86, endianness: object::Endianness::Little, section_bitness: BTreeMap::new() };
         let code = [0xAB];
         let mut parts = Vec::new();
         arch.display_instruction(
@@ -890,5 +982,119 @@ mod test {
             InstructionPart::opcode(".byte", OPCODE_DATA),
             InstructionPart::unsigned(0xABu64),
         ]);
+    }
+
+    // --- OMF reloc_size tests ---
+
+    #[test]
+    fn omf_reloc_size_byte_locations() {
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        for loc in [FixupLocation::LowByte, FixupLocation::HighByte] {
+            let flags =
+                RelocationFlags::Omf { location: loc, mode: FixupMode::SegmentRelative };
+            assert_eq!(arch.reloc_size(flags), Some(1), "location={loc:?}");
+        }
+    }
+
+    #[test]
+    fn omf_reloc_size_16bit_locations() {
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        for loc in [FixupLocation::Offset, FixupLocation::LoaderOffset, FixupLocation::Base] {
+            let flags =
+                RelocationFlags::Omf { location: loc, mode: FixupMode::SegmentRelative };
+            assert_eq!(arch.reloc_size(flags), Some(2), "location={loc:?}");
+        }
+    }
+
+    #[test]
+    fn omf_reloc_size_32bit_locations() {
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        for loc in [FixupLocation::Pointer, FixupLocation::Offset32, FixupLocation::LoaderOffset32]
+        {
+            let flags =
+                RelocationFlags::Omf { location: loc, mode: FixupMode::SegmentRelative };
+            assert_eq!(arch.reloc_size(flags), Some(4), "location={loc:?}");
+        }
+    }
+
+    #[test]
+    fn omf_reloc_size_pointer48() {
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        let flags =
+            RelocationFlags::Omf { location: FixupLocation::Pointer48, mode: FixupMode::SegmentRelative };
+        assert_eq!(arch.reloc_size(flags), Some(6));
+    }
+
+    // --- OMF reloc_name tests ---
+
+    #[test]
+    fn omf_reloc_name_segment_relative() {
+        use crate::arch::Arch as _;
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        let cases = [
+            (FixupLocation::LowByte, FixupMode::SegmentRelative, "OMF_LOW_BYTE"),
+            (FixupLocation::HighByte, FixupMode::SegmentRelative, "OMF_HIGH_BYTE"),
+            (FixupLocation::Offset, FixupMode::SegmentRelative, "OMF_OFFSET"),
+            (FixupLocation::LoaderOffset, FixupMode::SegmentRelative, "OMF_LOADER_OFFSET"),
+            (FixupLocation::Base, FixupMode::SegmentRelative, "OMF_BASE"),
+            (FixupLocation::Pointer, FixupMode::SegmentRelative, "OMF_PTR"),
+            (FixupLocation::Offset32, FixupMode::SegmentRelative, "OMF_OFFSET32"),
+            (FixupLocation::LoaderOffset32, FixupMode::SegmentRelative, "OMF_LOADER_OFFSET32"),
+            (FixupLocation::Pointer48, FixupMode::SegmentRelative, "OMF_PTR48"),
+        ];
+        for (loc, mode, expected) in cases {
+            assert_eq!(
+                arch.reloc_name(RelocationFlags::Omf { location: loc, mode }),
+                Some(expected),
+                "location={loc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn omf_reloc_name_self_relative() {
+        use crate::arch::Arch as _;
+        let arch = ArchX86 {
+            arch: Architecture::X86,
+            endianness: object::Endianness::Little,
+            section_bitness: BTreeMap::new(),
+        };
+        use object::omf::{FixupLocation, FixupMode};
+        let cases = [
+            (FixupLocation::Offset, FixupMode::SelfRelative, "OMF_REL_OFFSET"),
+            (FixupLocation::Offset32, FixupMode::SelfRelative, "OMF_REL_OFFSET32"),
+        ];
+        for (loc, mode, expected) in cases {
+            assert_eq!(
+                arch.reloc_name(RelocationFlags::Omf { location: loc, mode }),
+                Some(expected),
+                "location={loc:?}"
+            );
+        }
     }
 }

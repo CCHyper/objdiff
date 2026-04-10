@@ -18,6 +18,7 @@ use core::{
 };
 
 use flagset::{FlagSet, flags};
+use object::omf::{FixupLocation, FixupMode};
 
 use crate::{
     arch::{Arch, ArchDummy},
@@ -62,6 +63,11 @@ flags! {
     pub enum SectionFlag: u8 {
         /// Section combined from multiple input sections
         Combined,
+        /// Section uses 16-bit addressing (OMF USE16 segment).
+        /// When set on a Code section, the x86 decoder uses 16-bit mode.
+        Code16Bit,
+        /// Section contains read-only data (e.g. CONST, .rodata, .rdata).
+        ReadOnly,
     }
 }
 
@@ -374,6 +380,9 @@ pub struct Relocation {
 pub enum RelocationFlags {
     Elf(u32),
     Coff(u16),
+    /// OMF fixup. `location` determines the byte size and addressing mode.
+    /// `mode` distinguishes PC-relative (`SelfRelative`) from absolute (`SegmentRelative`).
+    Omf { location: FixupLocation, mode: FixupMode },
 }
 
 #[derive(Debug, Copy, Clone)]

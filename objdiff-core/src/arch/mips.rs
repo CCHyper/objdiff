@@ -323,7 +323,8 @@ impl Arch for ArchMips {
                 R_MIPS15_S3 => Some("R_MIPS15_S3"),
                 _ => None,
             },
-            _ => None,
+            RelocationFlags::Omf { .. } => None,
+            RelocationFlags::Coff(_) => None,
         }
     }
 
@@ -334,7 +335,8 @@ impl Arch for ArchMips {
                 elf::R_MIPS_32 => 4,
                 _ => 1,
             },
-            _ => 1,
+            RelocationFlags::Omf { .. } => 1,
+            RelocationFlags::Coff(_) => 1,
         }
     }
 

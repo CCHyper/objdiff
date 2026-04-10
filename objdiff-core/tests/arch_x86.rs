@@ -2,6 +2,7 @@ use objdiff_core::{diff, diff::display::SymbolFilter, obj};
 
 mod common;
 
+
 #[test]
 #[cfg(feature = "x86")]
 fn read_x86() {

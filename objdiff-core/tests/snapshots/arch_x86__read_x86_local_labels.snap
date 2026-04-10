@@ -6,6 +6,9 @@ Object {
     arch: ArchX86 {
         arch: X86,
         endianness: Little,
+        section_bitness: {
+            0: 32,
+        },
     },
     endianness: Little,
     symbols: [
