@@ -348,7 +348,6 @@ impl Arch for ArchPpc {
                 _ => 1,
             },
             RelocationFlags::Omf { .. } => 1,
-            RelocationFlags::Coff(_) => 1,
         }
     }
 

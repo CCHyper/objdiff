@@ -294,6 +294,17 @@ fn relocation_type(flags: obj::RelocationFlags) -> u32 {
     match flags {
         obj::RelocationFlags::Elf(r_type) => r_type,
         obj::RelocationFlags::Coff(typ) => typ as u32,
+        // OMF relocations encode location + mode rather than a single
+        // r_type integer. Pack into a u32 so the FFI surface can still
+        // round-trip it: low byte = location code, bit 8 = mode.
+        obj::RelocationFlags::Omf { location, mode } => {
+            let loc = location as u32;
+            let m = match mode {
+                object::omf::FixupMode::SegmentRelative => 1u32,
+                object::omf::FixupMode::SelfRelative => 0u32,
+            };
+            loc | (m << 8)
+        }
     }
 }
 

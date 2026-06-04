@@ -782,6 +782,7 @@ fn synthesize_data_labels(sections: &mut [Section], symbols: &mut Vec<Symbol>) {
             symbols.push(Symbol {
                 name: label_name,
                 demangled_name: Some(display_name),
+                normalized_name: None,
                 address: target_address,
                 size: string_size,
                 kind: SymbolKind::Object,

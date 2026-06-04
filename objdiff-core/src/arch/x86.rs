@@ -119,7 +119,7 @@ impl ArchX86 {
 }
 
 impl Arch for ArchX86 {
-    fn post_init(&mut self, sections: &[Section], _symbols: &[Symbol]) {
+    fn post_init(&mut self, sections: &[Section], _symbols: &[Symbol], _symbol_indices: &[usize]) {
         self.section_bitness.clear();
         for (index, section) in sections.iter().enumerate() {
             let bitness = if section.flags.contains(SectionFlag::Code16Bit) {
@@ -237,13 +237,13 @@ impl Arch for ArchX86 {
         if resolved.ins_ref.opcode == OPCODE_DATA {
             let (mnemonic, imm) = match resolved.ins_ref.size {
                 1 => (".byte", resolved.code[0] as u64),
-                2 => (".word", self.endianness.read_u16_bytes(resolved.code.try_into()?) as u64),
-                4 => (".dword", self.endianness.read_u32_bytes(resolved.code.try_into()?) as u64),
+                2 => (".word", self.endianness.read_u16(resolved.code.try_into()?) as u64),
+                4 => (".dword", self.endianness.read_u32(resolved.code.try_into()?) as u64),
                 6 => {
                     // 48-bit OMF far pointer: 32-bit offset + 16-bit segment selector.
                     let buf: [u8; 6] = resolved.code.try_into()?;
-                    let lo = self.endianness.read_u32_bytes(buf[..4].try_into()?);
-                    let hi = self.endianness.read_u16_bytes(buf[4..6].try_into()?);
+                    let lo = self.endianness.read_u32(buf[..4].try_into()?);
+                    let hi = self.endianness.read_u16(buf[4..6].try_into()?);
                     (".ptr48", ((hi as u64) << 32) | lo as u64)
                 }
                 _ => bail!("Unsupported x86 inline data size {}", resolved.ins_ref.size),
@@ -355,7 +355,7 @@ impl Arch for ArchX86 {
                         | object::omf::FixupLocation::Pointer48 => {
                             // 32-bit offset (or offset32 portion of seg:offset48)
                             let data = sec_data[off..off + 4].try_into()?;
-                            self.endianness.read_i32_bytes(data) as i64
+                            self.endianness.read_i32(data) as i64
                         }
                         object::omf::FixupLocation::Offset
                         | object::omf::FixupLocation::LoaderOffset
@@ -363,7 +363,7 @@ impl Arch for ArchX86 {
                         | object::omf::FixupLocation::Base => {
                             // 16-bit offset (or offset16 portion of seg:offset32)
                             let data = sec_data[off..off + 2].try_into()?;
-                            self.endianness.read_i16_bytes(data) as i64
+                            self.endianness.read_i16(data) as i64
                         }
                         object::omf::FixupLocation::LowByte
                         | object::omf::FixupLocation::HighByte => {
@@ -440,6 +440,10 @@ impl Arch for ArchX86 {
                     elf::R_386_16 => Some("R_386_16"),
                     _ => None,
                 },
+                // OMF relocations carry their name via the per-fixup OMF_*
+                // labels emitted earlier in this function. No per-arch named
+                // form is meaningful here.
+                RelocationFlags::Omf { .. } => None,
             },
             Architecture::X86_64 => match flags {
                 RelocationFlags::Coff(typ) => match typ {
