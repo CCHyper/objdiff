@@ -278,11 +278,20 @@ fn add_section_symbols(sections: &[Section], symbols: &mut Vec<Symbol>) {
 
 /// When inferring a symbol's size, we ignore symbols that start with specific prefixes. They are
 /// usually emitted as branch targets and do not represent the start of a function or object.
-fn is_local_label(symbol: &Symbol) -> bool {
+fn is_local_label(symbol: &Symbol, section: &Section) -> bool {
     const LABEL_PREFIXES: &[&str] = &[".L", "LAB_", "switchD_"];
-    symbol.size == 0
-        && symbol.flags.contains(SymbolFlag::Local)
-        && LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p))
+    // IDA names branch targets `loc_`/`locret_`, and switch bookkeeping `def_`/`jpt_`/`off_`.
+    // Objects unlinked from an IDA database (e.g. by unlinkerida) carry these as static symbols
+    // with no size, so without this they cut the enclosing function short at the first one.
+    // `jpt_`/`off_` are only labels in this sense inside a code section, where they are jump
+    // tables belonging to the function; in a data section they are ordinary data objects.
+    const IDA_CODE_LABEL_PREFIXES: &[&str] = &["loc_", "locret_", "def_", "jpt_", "off_"];
+    if symbol.size != 0 || !symbol.flags.contains(SymbolFlag::Local) {
+        return false;
+    }
+    LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p))
+        || (section.kind == SectionKind::Code
+            && IDA_CODE_LABEL_PREFIXES.iter().any(|p| symbol.name.starts_with(p)))
 }
 
 fn infer_symbol_sizes(arch: &dyn Arch, symbols: &mut [Symbol], sections: &[Section]) -> Result<()> {
@@ -325,7 +334,7 @@ fn infer_symbol_sizes(arch: &dyn Arch, symbols: &mut [Symbol], sections: &[Secti
                     // For labels (or anything else), stop at any symbol
                     true
                 }
-            } && !is_local_label(next_symbol)
+            } && !is_local_label(next_symbol, &sections[section_idx])
             {
                 break Some(next_symbol);
             }
